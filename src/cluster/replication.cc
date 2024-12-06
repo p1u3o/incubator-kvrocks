@@ -62,7 +62,7 @@ Status FeedSlaveThread::Start() {
     sigaddset(&mask, SIGHUP);
     sigaddset(&mask, SIGPIPE);
     pthread_sigmask(SIG_BLOCK, &mask, &omask);
-    auto s = util::SockSend(conn_->GetFD(), redis::SimpleString("OK"), conn_->GetBufferEvent());
+    auto s = util::SockSend(conn_->GetFD(), redis::RESP_OK, conn_->GetBufferEvent());
     if (!s.IsOK()) {
       LOG(ERROR) << "failed to send OK response to the replica: " << s.Msg();
       return;
@@ -252,7 +252,6 @@ void ReplicationThread::CallbacksStateMachine::Start() {
   }
 
   uint64_t last_connect_timestamp = 0;
-  int connect_timeout_ms = 3100;
 
   while (!repl_->stop_flag_ && bev == nullptr) {
     if (util::GetTimeStampMS() - last_connect_timestamp < 1000) {
@@ -260,7 +259,7 @@ void ReplicationThread::CallbacksStateMachine::Start() {
       sleep(1);
     }
     last_connect_timestamp = util::GetTimeStampMS();
-    auto cfd = util::SockConnect(repl_->host_, repl_->port_, connect_timeout_ms);
+    auto cfd = util::SockConnect(repl_->host_, repl_->port_, repl_->srv_->GetConfig()->replication_connect_timeout_ms);
     if (!cfd) {
       LOG(ERROR) << "[replication] Failed to connect the master, err: " << cfd.Msg();
       continue;
@@ -337,7 +336,7 @@ ReplicationThread::ReplicationThread(std::string host, uint32_t port, Server *sr
                     CallbackType{CallbacksStateMachine::WRITE, "fullsync write", &ReplicationThread::fullSyncWriteCB},
                     CallbackType{CallbacksStateMachine::READ, "fullsync read", &ReplicationThread::fullSyncReadCB}}) {}
 
-Status ReplicationThread::Start(std::function<void()> &&pre_fullsync_cb, std::function<void()> &&post_fullsync_cb) {
+Status ReplicationThread::Start(std::function<bool()> &&pre_fullsync_cb, std::function<void()> &&post_fullsync_cb) {
   pre_fullsync_cb_ = std::move(pre_fullsync_cb);
   post_fullsync_cb_ = std::move(post_fullsync_cb);
 
@@ -700,25 +699,28 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
       fullsync_state_ = kFetchMetaID;
       LOG(INFO) << "[replication] Succeeded fetching full data files info, fetching files in parallel";
 
+      bool pre_fullsync_done = false;
       // If 'slave-empty-db-before-fullsync' is yes, we call 'pre_fullsync_cb_'
       // just like reloading database. And we don't want slave to occupy too much
       // disk space, so we just empty entire database rudely.
       if (srv_->GetConfig()->slave_empty_db_before_fullsync) {
-        pre_fullsync_cb_();
+        if (!pre_fullsync_cb_()) return CBState::RESTART;
+        pre_fullsync_done = true;
         storage_->EmptyDB();
       }
 
       repl_state_.store(kReplFetchSST, std::memory_order_relaxed);
       auto s = parallelFetchFile(target_dir, meta.files);
       if (!s.IsOK()) {
+        if (pre_fullsync_done) post_fullsync_cb_();
         LOG(ERROR) << "[replication] Failed to parallel fetch files while " + s.Msg();
         return CBState::RESTART;
       }
       LOG(INFO) << "[replication] Succeeded fetching files in parallel, restoring the backup";
 
-      // Restore DB from backup
-      // We already call 'pre_fullsync_cb_' if 'slave-empty-db-before-fullsync' is yes
-      if (!srv_->GetConfig()->slave_empty_db_before_fullsync) pre_fullsync_cb_();
+      // Don't need to call 'pre_fullsync_cb_' again if it was called before
+      if (!pre_fullsync_done && !pre_fullsync_cb_()) return CBState::RESTART;
+
       // For old version, master uses rocksdb backup to implement data snapshot
       if (srv_->GetConfig()->master_use_repl_port) {
         s = storage_->RestoreFromBackup();
@@ -727,10 +729,18 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
       }
       if (!s.IsOK()) {
         LOG(ERROR) << "[replication] Failed to restore backup while " + s.Msg() + ", restart fullsync";
+        post_fullsync_cb_();
         return CBState::RESTART;
       }
       LOG(INFO) << "[replication] Succeeded restoring the backup, fullsync was finish";
       post_fullsync_cb_();
+
+      // It needs to reload namespaces from DB after the full sync is done,
+      // or namespaces are not visible in the replica.
+      s = srv_->GetNamespace()->LoadAndRewrite();
+      if (!s.IsOK()) {
+        LOG(ERROR) << "[replication] Failed to load and rewrite namespace: " << s.Msg();
+      }
 
       // Switch to psync state machine again
       psync_steps_.Start();
@@ -766,7 +776,10 @@ Status ReplicationThread::parallelFetchFile(const std::string &dir,
           }
           auto exit = MakeScopeExit([ssl] { SSL_free(ssl); });
 #endif
-          int sock_fd = GET_OR_RET(util::SockConnect(this->host_, this->port_, ssl).Prefixed("connect the server err"));
+          int sock_fd = GET_OR_RET(util::SockConnect(this->host_, this->port_, ssl,
+                                                     this->srv_->GetConfig()->replication_connect_timeout_ms,
+                                                     this->srv_->GetConfig()->replication_recv_timeout_ms)
+                                       .Prefixed("connect the server err"));
 #ifdef ENABLE_OPENSSL
           exit.Disable();
 #endif
@@ -863,6 +876,12 @@ Status ReplicationThread::fetchFile(int sock_fd, evbuffer *evbuf, const std::str
     UniqueEvbufReadln line(evbuf, EVBUFFER_EOL_CRLF_STRICT);
     if (!line) {
       if (auto s = util::EvbufferRead(evbuf, sock_fd, -1, ssl); !s) {
+        if (s.Is<Status::TryAgain>()) {
+          if (stop_flag_) {
+            return {Status::NotOK, "replication thread was stopped"};
+          }
+          continue;
+        }
         return std::move(s).Prefixed("read size");
       }
       continue;
@@ -896,6 +915,12 @@ Status ReplicationThread::fetchFile(int sock_fd, evbuffer *evbuf, const std::str
       remain -= data_len;
     } else {
       if (auto s = util::EvbufferRead(evbuf, sock_fd, -1, ssl); !s) {
+        if (s.Is<Status::TryAgain>()) {
+          if (stop_flag_) {
+            return {Status::NotOK, "replication thread was stopped"};
+          }
+          continue;
+        }
         return std::move(s).Prefixed("read sst file");
       }
     }

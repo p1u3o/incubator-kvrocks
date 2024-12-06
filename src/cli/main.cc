@@ -30,8 +30,8 @@
 #include <iomanip>
 #include <ostream>
 
-#include "config.h"
 #include "daemon_util.h"
+#include "glog/log_severity.h"
 #include "io_util.h"
 #include "pid_util.h"
 #include "scope_exit.h"
@@ -40,16 +40,14 @@
 #include "storage/storage.h"
 #include "string_util.h"
 #include "time_util.h"
-#include "unique_fd.h"
 #include "vendor/crc64.h"
-#include "version.h"
 #include "version_util.h"
 
 Server *srv = nullptr;
 
-extern "C" void SignalHandler(int sig) {
+extern "C" void SignalHandler([[maybe_unused]] int sig) {
   if (srv && !srv->IsStopped()) {
-    LOG(INFO) << "Bye Bye";
+    LOG(INFO) << "Signal " << sig << " received, stopping the server";
     srv->Stop();
   }
 }
@@ -103,7 +101,7 @@ static void InitGoogleLog(const Config *config) {
 
   if (util::EqualICase(config->log_dir, "stdout")) {
     for (int level = google::INFO; level <= google::FATAL; level++) {
-      google::SetLogDestination(level, "");
+      google::SetLogDestination(static_cast<google::LogSeverity>(level), "");
     }
     FLAGS_stderrthreshold = google::ERROR;
     FLAGS_logtostdout = true;
@@ -111,16 +109,14 @@ static void InitGoogleLog(const Config *config) {
   } else {
     FLAGS_log_dir = config->log_dir + "/";
     if (config->log_retention_days != -1) {
-      google::EnableLogCleaner(config->log_retention_days);
+      google::EnableLogCleaner(std::chrono::hours(24) * config->log_retention_days);
     }
   }
 }
 
 int main(int argc, char *argv[]) {
   srand(static_cast<unsigned>(util::GetTimeStamp()));
-
-  google::InitGoogleLogging("kvrocks");
-  auto glog_exit = MakeScopeExit(google::ShutdownGoogleLogging);
+  crc64_init();
 
   evthread_use_pthreads();
   auto event_exit = MakeScopeExit(libevent_global_shutdown);
@@ -136,14 +132,20 @@ int main(int argc, char *argv[]) {
     std::cout << "Failed to load config. Error: " << s.Msg() << std::endl;
     return 1;
   }
+  const auto socket_fd_exit = MakeScopeExit([&config] {
+    if (config.socket_fd != -1) {
+      close(config.socket_fd);
+    }
+  });
 
-  crc64_init();
   InitGoogleLog(&config);
+  google::InitGoogleLogging("kvrocks");
+  auto glog_exit = MakeScopeExit(google::ShutdownGoogleLogging);
   LOG(INFO) << "kvrocks " << PrintVersion;
   // Tricky: We don't expect that different instances running on the same port,
   // but the server use REUSE_PORT to support the multi listeners. So we connect
   // the listen port to check if the port has already listened or not.
-  if (!config.binds.empty()) {
+  if (config.socket_fd == -1 && !config.binds.empty()) {
     uint32_t ports[] = {config.port, config.tls_port, 0};
     for (uint32_t *port = ports; *port; ++port) {
       if (util::IsPortInUse(*port)) {
