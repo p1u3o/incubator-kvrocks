@@ -67,7 +67,7 @@ TEST(Config, GetAndSet) {
       {"rocksdb.max_write_buffer_number", "1"},
       {"rocksdb.target_file_size_base", "100"},
       {"rocksdb.max_background_compactions", "-1"},
-      {"rocksdb.max_sub_compactions", "3"},
+      {"rocksdb.max_subcompactions", "3"},
       {"rocksdb.delayed_write_rate", "1234"},
       {"rocksdb.stats_dump_period_sec", "600"},
       {"rocksdb.compaction_readahead_size", "1024"},
@@ -82,6 +82,7 @@ TEST(Config, GetAndSet) {
       {"rocksdb.max_bytes_for_level_multiplier", "10"},
       {"rocksdb.level_compaction_dynamic_level_bytes", "yes"},
       {"rocksdb.max_background_jobs", "4"},
+      {"rocksdb.compression_start_level", "2"},
   };
   std::vector<std::string> values;
   for (const auto &iter : mutable_cases) {
@@ -128,6 +129,7 @@ TEST(Config, GetAndSet) {
       {"rocksdb.row_cache_size", "100"},
       {"rocksdb.rate_limiter_auto_tuned", "yes"},
       {"rocksdb.compression_level", "32767"},
+      {"rocksdb.wal_compression", "no"},
   };
   for (const auto &iter : immutable_cases) {
     s = config.Set(nullptr, iter.first, iter.second);

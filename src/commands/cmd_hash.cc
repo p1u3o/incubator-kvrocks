@@ -29,10 +29,11 @@ namespace redis {
 
 class CommandHGet : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
     std::string value;
-    auto s = hash_db.Get(args_[1], args_[2], &value);
+
+    auto s = hash_db.Get(ctx, args_[1], args_[2], &value);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -54,10 +55,11 @@ class CommandHSetNX : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     uint64_t ret = 0;
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
-    auto s = hash_db.MSet(args_[1], field_values_, true, &ret);
+
+    auto s = hash_db.MSet(ctx, args_[1], field_values_, true, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -72,10 +74,11 @@ class CommandHSetNX : public Commander {
 
 class CommandHStrlen : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
     std::string value;
-    auto s = hash_db.Get(args_[1], args_[2], &value);
+
+    auto s = hash_db.Get(ctx, args_[1], args_[2], &value);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -87,7 +90,7 @@ class CommandHStrlen : public Commander {
 
 class CommandHDel : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     std::vector<Slice> fields;
     for (size_t i = 2; i < args_.size(); i++) {
       fields.emplace_back(args_[i]);
@@ -95,7 +98,8 @@ class CommandHDel : public Commander {
 
     uint64_t ret = 0;
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
-    auto s = hash_db.Delete(args_[1], fields, &ret);
+
+    auto s = hash_db.Delete(ctx, args_[1], fields, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -107,10 +111,11 @@ class CommandHDel : public Commander {
 
 class CommandHExists : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
     std::string value;
-    auto s = hash_db.Get(args_[1], args_[2], &value);
+
+    auto s = hash_db.Get(ctx, args_[1], args_[2], &value);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -122,10 +127,11 @@ class CommandHExists : public Commander {
 
 class CommandHLen : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     uint64_t count = 0;
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
-    auto s = hash_db.Size(args_[1], &count);
+
+    auto s = hash_db.Size(ctx, args_[1], &count);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -147,10 +153,11 @@ class CommandHIncrBy : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     int64_t ret = 0;
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
-    auto s = hash_db.IncrBy(args_[1], args_[2], increment_, &ret);
+
+    auto s = hash_db.IncrBy(ctx, args_[1], args_[2], increment_, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -174,10 +181,11 @@ class CommandHIncrByFloat : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     double ret = 0;
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
-    auto s = hash_db.IncrByFloat(args_[1], args_[2], increment_, &ret);
+
+    auto s = hash_db.IncrByFloat(ctx, args_[1], args_[2], increment_, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -192,7 +200,7 @@ class CommandHIncrByFloat : public Commander {
 
 class CommandHMGet : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     std::vector<Slice> fields;
     for (size_t i = 2; i < args_.size(); i++) {
       fields.emplace_back(args_[i]);
@@ -201,7 +209,8 @@ class CommandHMGet : public Commander {
     std::vector<std::string> values;
     std::vector<rocksdb::Status> statuses;
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
-    auto s = hash_db.MGet(args_[1], fields, &values, &statuses);
+
+    auto s = hash_db.MGet(ctx, args_[1], fields, &values, &statuses);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -228,10 +237,11 @@ class CommandHMSet : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     uint64_t ret = 0;
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
-    auto s = hash_db.MSet(args_[1], field_values_, false, &ret);
+
+    auto s = hash_db.MSet(ctx, args_[1], field_values_, false, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -239,7 +249,7 @@ class CommandHMSet : public Commander {
     if (GetAttributes()->name == "hset") {
       *output = redis::Integer(ret);
     } else {
-      *output = redis::SimpleString("OK");
+      *output = redis::RESP_OK;
     }
     return Status::OK();
   }
@@ -250,10 +260,11 @@ class CommandHMSet : public Commander {
 
 class CommandHKeys : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
     std::vector<FieldValue> field_values;
-    auto s = hash_db.GetAll(args_[1], &field_values, HashFetchType::kOnlyKey);
+
+    auto s = hash_db.GetAll(ctx, args_[1], &field_values, HashFetchType::kOnlyKey);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -271,10 +282,11 @@ class CommandHKeys : public Commander {
 
 class CommandHVals : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
     std::vector<FieldValue> field_values;
-    auto s = hash_db.GetAll(args_[1], &field_values, HashFetchType::kOnlyValue);
+
+    auto s = hash_db.GetAll(ctx, args_[1], &field_values, HashFetchType::kOnlyValue);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -292,10 +304,11 @@ class CommandHVals : public Commander {
 
 class CommandHGetAll : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
     std::vector<FieldValue> field_values;
-    auto s = hash_db.GetAll(args_[1], &field_values);
+
+    auto s = hash_db.GetAll(ctx, args_[1], &field_values);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -333,10 +346,11 @@ class CommandHRangeByLex : public Commander {
     }
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
     std::vector<FieldValue> field_values;
-    rocksdb::Status s = hash_db.RangeByLex(args_[1], spec_, &field_values);
+
+    rocksdb::Status s = hash_db.RangeByLex(ctx, args_[1], spec_, &field_values);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -357,12 +371,13 @@ class CommandHRangeByLex : public Commander {
 class CommandHScan : public CommandSubkeyScanBase {
  public:
   CommandHScan() = default;
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
     std::vector<std::string> fields;
     std::vector<std::string> values;
     auto key_name = srv->GetKeyNameFromCursor(cursor_, CursorType::kTypeHash);
-    auto s = hash_db.Scan(key_, key_name, limit_, prefix_, &fields, &values);
+
+    auto s = hash_db.Scan(ctx, key_, key_name, limit_, prefix_, &fields, &values);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -399,11 +414,11 @@ class CommandHRandField : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Hash hash_db(srv->storage, conn->GetNamespace());
     std::vector<FieldValue> field_values;
 
-    auto s = hash_db.RandField(args_[1], command_count_, &field_values,
+    auto s = hash_db.RandField(ctx, args_[1], command_count_, &field_values,
                                withvalues_ ? HashFetchType::kAll : HashFetchType::kOnlyKey);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
@@ -429,7 +444,7 @@ class CommandHRandField : public Commander {
   bool no_parameters_ = true;
 };
 
-REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandHGet>("hget", 3, "read-only", 1, 1, 1),
+REDIS_REGISTER_COMMANDS(Hash, MakeCmdAttr<CommandHGet>("hget", 3, "read-only", 1, 1, 1),
                         MakeCmdAttr<CommandHIncrBy>("hincrby", 4, "write", 1, 1, 1),
                         MakeCmdAttr<CommandHIncrByFloat>("hincrbyfloat", 4, "write", 1, 1, 1),
                         MakeCmdAttr<CommandHMSet>("hset", -4, "write", 1, 1, 1),
@@ -440,11 +455,11 @@ REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandHGet>("hget", 3, "read-only", 1, 1, 1
                         MakeCmdAttr<CommandHLen>("hlen", 2, "read-only", 1, 1, 1),
                         MakeCmdAttr<CommandHMGet>("hmget", -3, "read-only", 1, 1, 1),
                         MakeCmdAttr<CommandHMSet>("hmset", -4, "write", 1, 1, 1),
-                        MakeCmdAttr<CommandHKeys>("hkeys", 2, "read-only", 1, 1, 1),
-                        MakeCmdAttr<CommandHVals>("hvals", 2, "read-only", 1, 1, 1),
-                        MakeCmdAttr<CommandHGetAll>("hgetall", 2, "read-only", 1, 1, 1),
+                        MakeCmdAttr<CommandHKeys>("hkeys", 2, "read-only slow", 1, 1, 1),
+                        MakeCmdAttr<CommandHVals>("hvals", 2, "read-only slow", 1, 1, 1),
+                        MakeCmdAttr<CommandHGetAll>("hgetall", 2, "read-only slow", 1, 1, 1),
                         MakeCmdAttr<CommandHScan>("hscan", -3, "read-only", 1, 1, 1),
                         MakeCmdAttr<CommandHRangeByLex>("hrangebylex", -4, "read-only", 1, 1, 1),
-                        MakeCmdAttr<CommandHRandField>("hrandfield", -2, "read-only", 1, 1, 1), )
+                        MakeCmdAttr<CommandHRandField>("hrandfield", -2, "read-only slow", 1, 1, 1), )
 
 }  // namespace redis

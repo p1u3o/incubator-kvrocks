@@ -28,6 +28,7 @@
 #include "commands/commander.h"
 #include "commands/error_constants.h"
 #include "fmt/format.h"
+#include "nonstd/span.hpp"
 #include "search/indexer.h"
 #include "server/redis_reply.h"
 #include "string_util.h"
@@ -79,7 +80,7 @@ void Connection::Close() {
 
 void Connection::Detach() { owner_->DetachConnection(this); }
 
-void Connection::OnRead(struct bufferevent *bev) {
+void Connection::OnRead([[maybe_unused]] struct bufferevent *bev) {
   is_running_ = true;
   MakeScopeExit([this] { is_running_ = false; });
 
@@ -98,7 +99,7 @@ void Connection::OnRead(struct bufferevent *bev) {
   }
 }
 
-void Connection::OnWrite(bufferevent *bev) {
+void Connection::OnWrite([[maybe_unused]] bufferevent *bev) {
   if (IsFlagEnabled(kCloseAfterReply) || IsFlagEnabled(kCloseAsync)) {
     Close();
   }
@@ -131,58 +132,6 @@ void Connection::OnEvent(bufferevent *bev, int16_t events) {
 void Connection::Reply(const std::string &msg) {
   owner_->srv->stats.IncrOutboundBytes(msg.size());
   redis::Reply(bufferevent_get_output(bev_), msg);
-}
-
-std::string Connection::Bool(bool b) const {
-  if (protocol_version_ == RESP::v3) {
-    return b ? "#t" CRLF : "#f" CRLF;
-  }
-  return Integer(b ? 1 : 0);
-}
-
-std::string Connection::MultiBulkString(const std::vector<std::string> &values) const {
-  std::string result = MultiLen(values.size());
-  for (const auto &value : values) {
-    if (value.empty()) {
-      result += NilString();
-    } else {
-      result += BulkString(value);
-    }
-  }
-  return result;
-}
-
-std::string Connection::MultiBulkString(const std::vector<std::string> &values,
-                                        const std::vector<rocksdb::Status> &statuses) const {
-  std::string result = MultiLen(values.size());
-  for (size_t i = 0; i < values.size(); i++) {
-    if (i < statuses.size() && !statuses[i].ok()) {
-      result += NilString();
-    } else {
-      result += BulkString(values[i]);
-    }
-  }
-  return result;
-}
-
-std::string Connection::SetOfBulkStrings(const std::vector<std::string> &elems) const {
-  std::string result;
-  result += HeaderOfSet(elems.size());
-  for (const auto &elem : elems) {
-    result += BulkString(elem);
-  }
-  return result;
-}
-
-std::string Connection::MapOfBulkStrings(const std::vector<std::string> &elems) const {
-  CHECK(elems.size() % 2 == 0);
-
-  std::string result;
-  result += HeaderOfMap(elems.size() / 2);
-  for (const auto &elem : elems) {
-    result += BulkString(elem);
-  }
-  return result;
 }
 
 void Connection::SendFile(int fd) {
@@ -395,25 +344,30 @@ void Connection::RecordProfilingSampleIfNeed(const std::string &cmd, uint64_t du
   srv_->GetPerfLog()->PushEntry(std::move(entry));
 }
 
-Status Connection::ExecuteCommand(const std::string &cmd_name, const std::vector<std::string> &cmd_tokens,
-                                  Commander *current_cmd, std::string *reply) {
+Status Connection::ExecuteCommand(engine::Context &ctx, const std::string &cmd_name,
+                                  const std::vector<std::string> &cmd_tokens, Commander *current_cmd,
+                                  std::string *reply) {
   srv_->stats.IncrCalls(cmd_name);
 
   auto start = std::chrono::high_resolution_clock::now();
   bool is_profiling = IsProfilingEnabled(cmd_name);
-  auto s = current_cmd->Execute(srv_, this, reply);
+  auto s = current_cmd->Execute(ctx, srv_, this, reply);
   auto end = std::chrono::high_resolution_clock::now();
   uint64_t duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
   if (is_profiling) RecordProfilingSampleIfNeed(cmd_name, duration);
 
   srv_->SlowlogPushEntryIfNeeded(&cmd_tokens, duration, this);
   srv_->stats.IncrLatency(static_cast<uint64_t>(duration), cmd_name);
-  srv_->FeedMonitorConns(this, cmd_tokens);
   return s;
 }
 
-static bool IsHashOrJsonCommand(const std::string &cmd) {
-  return util::HasPrefix(cmd, "h") || util::HasPrefix(cmd, "json.");
+static bool IsCmdForIndexing(uint64_t cmd_flags, CommandCategory cmd_cat) {
+  return (cmd_flags & redis::kCmdWrite) &&
+         (cmd_cat == CommandCategory::Hash || cmd_cat == CommandCategory::JSON || cmd_cat == CommandCategory::Key);
+}
+
+static bool IsCmdAllowedInStaleData(const std::string &cmd_name) {
+  return cmd_name == "info" || cmd_name == "slaveof" || cmd_name == "config";
 }
 
 void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
@@ -432,7 +386,11 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
     auto cmd_s = Server::LookupAndCreateCommand(cmd_tokens.front());
     if (!cmd_s.IsOK()) {
       if (is_multi_exec) multi_error_ = true;
-      Reply(redis::Error({Status::NotOK, "unknown command " + cmd_tokens.front()}));
+      Reply(redis::Error(
+          {Status::NotOK,
+           fmt::format("unknown command `{}`, with args beginning with: {}", cmd_tokens.front(),
+                       util::StringJoin(nonstd::span(cmd_tokens.begin() + 1, cmd_tokens.end()),
+                                        [](const auto &v) -> decltype(auto) { return fmt::format("`{}`", v); }))}));
       continue;
     }
     auto current_cmd = std::move(*cmd_s);
@@ -443,7 +401,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
 
     if (GetNamespace().empty()) {
       if (!password.empty()) {
-        if (cmd_name != "auth" && cmd_name != "hello") {
+        if (!(cmd_flags & kCmdAuth)) {
           Reply(redis::Error({Status::RedisNoAuth, "Authentication required."}));
           continue;
         }
@@ -459,21 +417,12 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
     // that can guarantee other threads can't come into critical zone, such as DEBUG,
     // CLUSTER subcommand, CONFIG SET, MULTI, LUA (in the immediate future).
     // Otherwise, we just use 'ConcurrencyGuard' to allow all workers to execute commands at the same time.
-    if (is_multi_exec && cmd_name != "exec") {
+    if (is_multi_exec && !(cmd_flags & kCmdBypassMulti)) {
       // No lock guard, because 'exec' command has acquired 'WorkExclusivityGuard'
     } else if (cmd_flags & kCmdExclusive) {
       exclusivity = srv_->WorkExclusivityGuard();
-
-      // When executing lua script commands that have "exclusive" attribute, we need to know current connection,
-      // but we should set current connection after acquiring the WorkExclusivityGuard to make it thread-safe
-      srv_->SetCurrentConnection(this);
     } else {
       concurrency = srv_->WorkConcurrencyGuard();
-    }
-
-    if (cmd_flags & kCmdROScript) {
-      // if executing read only lua script commands, set current connection.
-      srv_->SetCurrentConnection(this);
     }
 
     if (srv_->IsLoading() && !(cmd_flags & kCmdLoading)) {
@@ -498,7 +447,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
     }
 
     if (is_multi_exec && (cmd_flags & kCmdNoMulti)) {
-      Reply(redis::Error({Status::NotOK, "Can't execute " + cmd_name + " in MULTI"}));
+      Reply(redis::Error({Status::NotOK, fmt::format("{} inside MULTI is not allowed", util::ToUpper(cmd_name))}));
       multi_error_ = true;
       continue;
     }
@@ -517,9 +466,9 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
       DisableFlag(kAsking);
     }
 
-    // We don't execute commands, but queue them, ant then execute in EXEC command
-    if (is_multi_exec && !in_exec_ && !(cmd_flags & kCmdMulti)) {
-      multi_cmds_.emplace_back(cmd_tokens);
+    // We don't execute commands, but queue them, and then execute in EXEC command
+    if (is_multi_exec && !in_exec_ && !(cmd_flags & kCmdBypassMulti)) {
+      multi_cmds_.emplace_back(std::move(cmd_tokens));
       Reply(redis::SimpleString("QUEUED"));
       continue;
     }
@@ -534,7 +483,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
       continue;
     }
 
-    if (!config->slave_serve_stale_data && srv_->IsSlave() && cmd_name != "info" && cmd_name != "slaveof" &&
+    if (!config->slave_serve_stale_data && srv_->IsSlave() && !IsCmdAllowedInStaleData(cmd_name) &&
         srv_->GetReplicationState() != kReplConnected) {
       Reply(redis::Error({Status::RedisMasterDown,
                           "Link with MASTER is down "
@@ -542,35 +491,55 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
       continue;
     }
 
-    // TODO: transaction support for index recording
-    std::vector<GlobalIndexer::RecordResult> index_records;
-    if (IsHashOrJsonCommand(cmd_name) && (attributes->flags & redis::kCmdWrite) && !config->cluster_enabled) {
-      attributes->ForEachKeyRange(
-          [&, this](const std::vector<std::string> &args, const CommandKeyRange &key_range) {
-            key_range.ForEachKey(
-                [&, this](const std::string &key) {
-                  auto res = srv_->indexer.Record(key, ns_);
-                  if (res.IsOK()) {
-                    index_records.push_back(*res);
-                  } else if (!res.Is<Status::NoPrefixMatched>() && !res.Is<Status::TypeMismatched>()) {
-                    LOG(WARNING) << "index recording failed for key: " << key;
-                  }
-                },
-                args);
-          },
-          cmd_tokens);
-    }
-
     SetLastCmd(cmd_name);
-    s = ExecuteCommand(cmd_name, cmd_tokens, current_cmd.get(), &reply);
+    {
+      std::optional<MultiLockGuard> guard;
+      if (cmd_flags & kCmdWrite) {
+        std::vector<std::string> lock_keys;
+        attributes->ForEachKeyRange(
+            [&lock_keys, this](const std::vector<std::string> &args, const CommandKeyRange &key_range) {
+              key_range.ForEachKey(
+                  [&, this](const std::string &key) {
+                    auto ns_key = ComposeNamespaceKey(ns_, key, srv_->storage->IsSlotIdEncoded());
+                    lock_keys.emplace_back(std::move(ns_key));
+                  },
+                  args);
+            },
+            cmd_tokens);
 
-    // TODO: transaction support for index updating
-    for (const auto &record : index_records) {
-      auto s = GlobalIndexer::Update(record);
-      if (!s.IsOK() && !s.Is<Status::TypeMismatched>()) {
-        LOG(WARNING) << "index updating failed for key: " << record.key;
+        guard.emplace(srv_->storage->GetLockManager(), lock_keys);
+      }
+      engine::Context ctx(srv_->storage);
+
+      std::vector<GlobalIndexer::RecordResult> index_records;
+      if (!srv_->index_mgr.index_map.empty() && IsCmdForIndexing(cmd_flags, attributes->category) &&
+          !config->cluster_enabled) {
+        attributes->ForEachKeyRange(
+            [&, this](const std::vector<std::string> &args, const CommandKeyRange &key_range) {
+              key_range.ForEachKey(
+                  [&, this](const std::string &key) {
+                    auto res = srv_->indexer.Record(ctx, key, ns_);
+                    if (res.IsOK()) {
+                      index_records.push_back(*res);
+                    } else if (!res.Is<Status::NoPrefixMatched>() && !res.Is<Status::TypeMismatched>()) {
+                      LOG(WARNING) << "index recording failed for key: " << key;
+                    }
+                  },
+                  args);
+            },
+            cmd_tokens);
+      }
+
+      s = ExecuteCommand(ctx, cmd_name, cmd_tokens, current_cmd.get(), &reply);
+      for (const auto &record : index_records) {
+        auto s = GlobalIndexer::Update(ctx, record);
+        if (!s.IsOK() && !s.Is<Status::TypeMismatched>()) {
+          LOG(WARNING) << "index updating failed for key: " << record.key;
+        }
       }
     }
+
+    srv_->FeedMonitorConns(this, cmd_tokens);
 
     // Break the execution loop when occurring the blocking command like BLPOP or BRPOP,
     // it will suspend the connection and wait for the wakeup signal.
